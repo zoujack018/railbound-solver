@@ -196,7 +196,7 @@ function zeroSafetyLookahead(puzzle, cars, ctx) {
     const tsTriggeredColors = [];
     const autoUsedKeys = [];
     const releaseTSLocks = new Set();
-    /* Edge-swap collision removed: trains can pass each other on curves/T-junctions */
+    /* Edge-swap is NOT a collision in Railbound */
 
     for (const c of zeroCars) {
       const k = pk(c.x, c.y);
@@ -263,9 +263,23 @@ function zeroSafetyLookahead(puzzle, cars, ctx) {
       const tailAx = ca.x + DELTA[ca.entry][0], tailAy = ca.y + DELTA[ca.entry][1];
       for (let b = a + 1; b < nxt.length; b++) {
         const cb = nxt[b];
-        if (cb.x === tailAx && cb.y === tailAy && cb.entry === ca.entry) return { ok: false, reason: "追尾", detail: { errorCode: 'TAILING', leader: ca.name, follower: cb.name, leaderCell: pk(ca.x, ca.y), followerCell: pk(cb.x, cb.y), direction: ca.entry } };
+        if (cb.x === tailAx && cb.y === tailAy && cb.entry === ca.entry) {
+          const ak = pk(ca.x, ca.y);
+          const aTrack = tm[ak] ? null : effectiveTrackAt(ak, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
+          const aExit = aTrack ? exitPort(aTrack, ca.entry) : null;
+          if (!aTrack || (aExit && aExit === OPPOSITE[ca.entry])) {
+            return { ok: false, reason: "追尾", detail: { errorCode: 'TAILING', leader: ca.name, follower: cb.name, leaderCell: pk(ca.x, ca.y), followerCell: pk(cb.x, cb.y), direction: ca.entry } };
+          }
+        }
         const tailBx = cb.x + DELTA[cb.entry][0], tailBy = cb.y + DELTA[cb.entry][1];
-        if (ca.x === tailBx && ca.y === tailBy && ca.entry === cb.entry) return { ok: false, reason: "追尾", detail: { errorCode: 'TAILING', leader: cb.name, follower: ca.name, leaderCell: pk(cb.x, cb.y), followerCell: pk(ca.x, ca.y), direction: cb.entry } };
+        if (ca.x === tailBx && ca.y === tailBy && ca.entry === cb.entry) {
+          const bk = pk(cb.x, cb.y);
+          const bTrack = tm[bk] ? null : effectiveTrackAt(bk, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
+          const bExit = bTrack ? exitPort(bTrack, cb.entry) : null;
+          if (!bTrack || (bExit && bExit === OPPOSITE[cb.entry])) {
+            return { ok: false, reason: "追尾", detail: { errorCode: 'TAILING', leader: cb.name, follower: ca.name, leaderCell: pk(cb.x, cb.y), followerCell: pk(ca.x, ca.y), direction: cb.entry } };
+          }
+        }
       }
     }
 
@@ -336,9 +350,7 @@ function simulate(puzzle, placed) {
     const tsTriggeredColors = [];
     const autoUsedKeys = [];
     const releaseTSLocks = new Set();
-    /* Edge-swap collision removed: in Railbound, trains on curves/T-junctions
-       can pass each other when moving in opposite directions. Only cell-occupancy
-       and tailing collisions are checked. */
+    /* Edge-swap allowed (prevPos tracking removed) */
 
     for (const c0 of cars) {
       const c = c0;
@@ -416,17 +428,41 @@ function simulate(puzzle, placed) {
         if (occ.has(pkPair)) return { ok: false, reason: "碰撞", arrived, steps: t, history, detail: { errorCode: 'TUNNEL_COLLISION', car: c.name, cells: [k, pkPair] } }; occ.add(pkPair);
       }
     }
-    /* tailing ban: reject if any car is directly behind another heading the same way */
+    /* tailing ban: reject if any car is directly behind another heading the same way
+       AND the leader continues straight (doesn't turn on a curve/T-junction).
+       On curves/T-junctions the leader turns away, so the follower won't crash into it. */
     for (let i = 0; i < nxt.length; i++) {
       const a = nxt[i];
       const tailAx = a.x + DELTA[a.entry][0], tailAy = a.y + DELTA[a.entry][1];
       for (let j = i + 1; j < nxt.length; j++) {
         const b = nxt[j];
-        if (b.x === tailAx && b.y === tailAy && b.entry === a.entry) return { ok: false, reason: "追尾", arrived, steps: t, history, detail: { errorCode: 'TAILING', leader: a.name, follower: b.name, leaderCell: pk(a.x, a.y), followerCell: pk(b.x, b.y), direction: a.entry } };
+        if (b.x === tailAx && b.y === tailAy && b.entry === a.entry) {
+          /* Check: does leader 'a' continue straight from its cell? */
+          const ak = pk(a.x, a.y);
+          const aTrack = tm[ak] ? null : effectiveTrackAt(ak, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
+          const aExit = aTrack ? exitPort(aTrack, a.entry) : null;
+          const goStraight = aExit && aExit === OPPOSITE[a.entry];
+          if (goStraight || !aTrack) {
+            return { ok: false, reason: "追尾", arrived, steps: t, history, detail: { errorCode: 'TAILING', leader: a.name, follower: b.name, leaderCell: pk(a.x, a.y), followerCell: pk(b.x, b.y), direction: a.entry } };
+          }
+        }
         const tailBx = b.x + DELTA[b.entry][0], tailBy = b.y + DELTA[b.entry][1];
-        if (a.x === tailBx && a.y === tailBy && a.entry === b.entry) return { ok: false, reason: "追尾", arrived, steps: t, history, detail: { errorCode: 'TAILING', leader: b.name, follower: a.name, leaderCell: pk(b.x, b.y), followerCell: pk(a.x, a.y), direction: b.entry } };
+        if (a.x === tailBx && a.y === tailBy && a.entry === b.entry) {
+          /* Check: does leader 'b' continue straight from its cell? */
+          const bk = pk(b.x, b.y);
+          const bTrack = tm[bk] ? null : effectiveTrackAt(bk, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
+          const bExit = bTrack ? exitPort(bTrack, b.entry) : null;
+          const goStraight = bExit && bExit === OPPOSITE[b.entry];
+          if (goStraight || !bTrack) {
+            return { ok: false, reason: "追尾", arrived, steps: t, history, detail: { errorCode: 'TAILING', leader: b.name, follower: a.name, leaderCell: pk(b.x, b.y), followerCell: pk(a.x, a.y), direction: b.entry } };
+          }
+        }
       }
     }
+
+    /* Edge-swap is allowed in Railbound: trains can pass each other on the same
+       edge between cells. The user's correct solution confirms this (car 3 and car 0.1
+       swap at cells 3,3↔3,2 at step 28). */
 
     /* FIX: suppress toggle if any car occupies a barrier of that color */
     const blocked = occupiedBarrierColors(nxt, barriers);

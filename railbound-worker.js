@@ -309,10 +309,13 @@ function solveCSP(pz, maxCost, bs, meta) {
       if (arrival > priorMaxArrival) priorMaxArrival = arrival;
     }
   }
+  /* FIX: Skip zero car in CSP path enumeration entirely.
+     Zero cars don't reach the goal, so enumerating their paths causes
+     massive path explosion (pathSlack=30, no goal constraint).
+     Their correctness is validated by quickCollisionCheck + simulate(). */
   const allPathResults = pz.cars.map(car => {
-    const iz = isZeroCar(car);
-    const customPz = iz ? { ...pz, pathSlack: 30 } : pz;
-    return enumeratePaths(car, customPz, bs, meta, maxCost, waypointsByCar[car.name], minRequiredByCar[car.name] || 0, blockedByCar[car.name]);
+    if (isZeroCar(car)) return { paths: [], overflow: false, minSteps: Infinity, minLen: 0, maxLen: 0 };
+    return enumeratePaths(car, pz, bs, meta, maxCost, waypointsByCar[car.name], minRequiredByCar[car.name] || 0, blockedByCar[car.name]);
   });
   const allPaths = allPathResults.map(r => r.paths);
   const overflow = allPathResults.some(r => r.overflow);
@@ -323,9 +326,11 @@ function solveCSP(pz, maxCost, bs, meta) {
   const info = "paths: " + allPaths.map((p, i) => "c" + pz.cars[i].name + "=" + p.length + (allPathResults[i].overflow ? "!" : "") + "[" + allPathResults[i].minLen + "-" + allPathResults[i].maxLen + "]").join(" x ");
   self.postMessage({ type: "progress", iters: 0, cspInfo: info });
 
+  /* FIX: Exclude zero car indices from CSP merge order.
+     Zero cars have no paths in CSP; they are validated post-hoc. */
   const order = [];
   for (const name of pz.order) { const ci = pz.cars.findIndex(c => String(c.name) === String(name)); if (ci >= 0) order.push(ci); }
-  for (let i = 0; i < pz.cars.length; i++) if (!order.includes(i) && allPaths[i].length > 0) order.push(i);
+  for (let i = 0; i < pz.cars.length; i++) if (!order.includes(i) && !isZeroCar(pz.cars[i]) && allPaths[i].length > 0) order.push(i);
   let bestSol = null, bestCost = maxCost + 1, iters = 0;
   const alternates = [], alternateKeys = new Set();
   const MAX_I = 15000000;
@@ -457,7 +462,7 @@ function solveCSP(pz, maxCost, bs, meta) {
     let cars = pz.cars.map(c => ({ ...c, wait: c.wait || 0 }));
     for (let s = 1; s <= ms; s++) {
       const nxt = [], triggeredColors = [], tsTriggeredColors = [], autoUsedKeys = [], releaseTSLocks = new Set();
-      /* Edge-swap collision removed: trains can pass each other on curves/T-junctions */
+      /* Edge-swap allowed in Railbound */
       for (const c of cars) {
         if (c.wait > 0) { nxt.push({ ...c, wait: c.wait - 1 }); continue; }
         let x = c.x, y = c.y, entry = c.entry, nx, ny, ne;
@@ -507,16 +512,27 @@ function solveCSP(pz, maxCost, bs, meta) {
         if (occ.has(k)) return true; occ.add(k);
         if (tm[k]) { const pkp = pk(tm[k].pair.x, tm[k].pair.y); if (occ.has(pkp)) return true; occ.add(pkp); }
       }
-      /* tailing ban */
+      /* tailing ban — only when leader goes straight (doesn't turn on curve/T-junction) */
       for (let i = 0; i < nxt.length; i++) {
         const a = nxt[i]; const tax = a.x + DELTA[a.entry][0], tay = a.y + DELTA[a.entry][1];
         for (let j = i + 1; j < nxt.length; j++) {
           const b = nxt[j];
-          if (b.x === tax && b.y === tay && b.entry === a.entry) return true;
+          if (b.x === tax && b.y === tay && b.entry === a.entry) {
+            const ak = pk(a.x, a.y);
+            const aT = tm[ak] ? null : effectiveTrackAt(ak, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
+            const aEx = aT ? exitPort(aT, a.entry) : null;
+            if (!aT || (aEx && aEx === OPPOSITE[a.entry])) return true;
+          }
           const tbx = b.x + DELTA[b.entry][0], tby = b.y + DELTA[b.entry][1];
-          if (a.x === tbx && a.y === tby && a.entry === b.entry) return true;
+          if (a.x === tbx && a.y === tby && a.entry === b.entry) {
+            const bk = pk(b.x, b.y);
+            const bT = tm[bk] ? null : effectiveTrackAt(bk, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
+            const bEx = bT ? exitPort(bT, b.entry) : null;
+            if (!bT || (bEx && bEx === OPPOSITE[b.entry])) return true;
+          }
         }
       }
+      /* Edge-swap allowed in Railbound */
       const blocked = occupiedBarrierColors(nxt, barriers);
       cars = nxt;
       for (const name of releaseTSLocks) delete tsLocks[name];
@@ -651,7 +667,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
   function hasUsage(k, entry, exit) { const arr = useMap[k]; return !!arr && arr.some(u => u.entry === entry && u.exit === exit); }
   function pushUsage(k, entry, exit) {
     if (!useMap[k]) useMap[k] = [];
-    if (hasUsage(k, entry, exit)) return () => {};
+    if (hasUsage(k, entry, exit)) return () => { };
     useMap[k].push({ entry, exit });
     return () => { useMap[k].pop(); if (!useMap[k].length) delete useMap[k]; };
   }
@@ -714,7 +730,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
     });
     if (seed > 0 && result.length > 1) {
       let s = seed ^ (iters * 2654435761 >>> 0);
-      for (let i = result.length - 1; i > 0; i--) { s = (s * 1664525 + 1013904223) & 0x7fffffff; const j = s % (i + 1); [result[i], result[j]] = [result[j], result[i]]; }
+      for (let i = result.length - 1; i > 0; i--) { s = (s * 1664525 + 1013904223) & 0x7fffffff; const j = s % (i + 1);[result[i], result[j]] = [result[j], result[i]]; }
     }
     return result;
   }
@@ -756,6 +772,20 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
       if (placed[k]) {
         const old = placed[k];
         const ex0 = exitPort(old, c.entry);
+        /* FIX: Zero cars on already-placed tracks should not force upgrades
+           or block DFS progress. If the track works for them, just continue.
+           If not (ex0 is null), zero cars should skip (not abort DFS). */
+        if (isZeroCar(c)) {
+          if (ex0 !== null) {
+            if (!hasUsage(k, c.entry, ex0)) {
+              const undo = pushUsage(k, c.entry, ex0);
+              dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo(); return;
+            }
+            continue;
+          }
+          /* Zero car can't traverse this placed track — simulation will catch this as an error */
+          return;
+        }
         const ups = findUpgrades(old, c.x, c.y, c.entry);
         for (const up of ups) {
           if (up.exit === ex0) continue;
@@ -806,6 +836,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
 
     const nxt = [], na = [...arrived], _trgd = [], _tsTrgd = [], _autoUsed = [], _releaseTSLocks = new Set();
     const _nServed = _hasPlatforms ? new Set(servedPlatforms) : servedPlatforms;
+    /* Edge-swap allowed in Railbound */
     for (const c0 of cars) {
       const c = c0; const k = pk(c.x, c.y);
       if (c.wait > 0) { nxt.push({ ...c, wait: c.wait - 1 }); continue; }
@@ -849,8 +880,11 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
         if (_cs === 'closed') { nx = c.x; ny = c.y; ne = c.entry; }
       }
       if (nx !== c.x || ny !== c.y) {
-
-        if (!isZeroCar(c) && !cellCanAcceptDFS(nx, ny, ne)) { visited.delete(sk); return; }
+        /* FIX: Apply cellCanAcceptDFS to ALL cars including zero cars.
+           Previously zero cars were exempted, letting them move to cells without
+           tracks. This caused the next DFS step to abort the entire branch
+           (no track for zero car), cascading into missed valid solutions. */
+        if (!cellCanAcceptDFS(nx, ny, ne)) { visited.delete(sk); return; }
         if (_trigMap[_nk]) _trgd.push(_trigMap[_nk]);
         if (_tswMap[_nk]) _tsTrgd.push(_tswMap[_nk]);
         if (_usedAutoSwitch) _autoUsed.push(k);
@@ -869,17 +903,29 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
       const k = pk(c.x, c.y); if (occ.has(k)) { visited.delete(sk); return; } occ.add(k);
       if (tm[k]) { const pkp = pk(tm[k].pair.x, tm[k].pair.y); if (occ.has(pkp)) { visited.delete(sk); return; } occ.add(pkp); }
     }
+    /* tailing ban — only when leader goes straight */
     let _tail = false;
     for (let i = 0; i < nxt.length && !_tail; i++) {
       const a = nxt[i]; const tax = a.x + DELTA[a.entry][0], tay = a.y + DELTA[a.entry][1];
       for (let j = i + 1; j < nxt.length; j++) {
         const b = nxt[j];
-        if (b.x === tax && b.y === tay && b.entry === a.entry) { _tail = true; break; }
+        if (b.x === tax && b.y === tay && b.entry === a.entry) {
+          const ak = pk(a.x, a.y);
+          const aT = tm[ak] ? null : effectiveTrackAt(ak, { ...pz.fixed, ...placed }, _tswitchMap, tsToggled, _autoSwitchMap, autoToggled);
+          const aEx = aT ? exitPort(aT, a.entry) : null;
+          if (!aT || (aEx && aEx === OPPOSITE[a.entry])) { _tail = true; break; }
+        }
         const tbx = b.x + DELTA[b.entry][0], tby = b.y + DELTA[b.entry][1];
-        if (a.x === tbx && a.y === tby && a.entry === b.entry) { _tail = true; break; }
+        if (a.x === tbx && a.y === tby && a.entry === b.entry) {
+          const bk = pk(b.x, b.y);
+          const bT = tm[bk] ? null : effectiveTrackAt(bk, { ...pz.fixed, ...placed }, _tswitchMap, tsToggled, _autoSwitchMap, autoToggled);
+          const bEx = bT ? exitPort(bT, b.entry) : null;
+          if (!bT || (bEx && bEx === OPPOSITE[b.entry])) { _tail = true; break; }
+        }
       }
     }
     if (_tail) { visited.delete(sk); return; }
+    /* Edge-swap allowed in Railbound */
 
     const _blocked = occupiedBarrierColors(nxt, _barMap);
     const _nt = _hasBars && _trgd.length ? { ...toggled } : toggled;
@@ -900,69 +946,12 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
   return solutions.slice(0, Math.max(maxSol, MAX_ALTERNATES));
 }
 
-// ═══════════ Zero-Aware Solver (Hybrid) ═══════════
-
-function solveZeroAware(pz, bs, meta, budget, seed) {
-  /* Boost zeroSafetySteps for auto-switch puzzles — need enough steps for
-     the zero car's cycle to repeat (state revisit). Use 2*(width+height)
-     as a reasonable upper bound — large enough to detect cycles through
-     auto-switch mazes without making DFS validation too expensive. */
-  const boostedSafety = Math.max(zeroSafetySteps(pz), 2 * (pz.width + pz.height));
-  const pzBoosted = { ...pz, zeroSafetySteps: boostedSafety };
-
-  // Diagnosis is built inline from Phase 1/3 results to avoid redundant re-solves
-  const diagnosis = { hasZero: true, hasAutoSwitch: true, normalOnlyResult: null, zeroCycleResult: null, compatResult: null };
-
-  self.postMessage({ type: "progress", info: `Phase 1: Normal-first search (zeroSafety=${boostedSafety})...` });
-  const normalPz = { ...pzBoosted, cars: pz.cars.filter(c => !isZeroCar(c)) };
-  const normalSols = solveDFS(normalPz, 50, false, budget, seed, bs, meta);
-  diagnosis.normalOnlyResult = { ok: normalSols.length > 0, count: normalSols.length };
-
-  if (normalSols.length > 0) {
-    self.postMessage({ type: "progress", info: `Phase 2: Validating ${normalSols.length} normal candidates with zero car...` });
-    for (const nsol of normalSols) {
-      const remainingBlanks = pz.blanks.filter(b => !nsol[pk(b[0], b[1])]);
-      const remainingBs = new Set(remainingBlanks.map(b => pk(b[0], b[1])));
-      // Pass full budget — solveDFS now subtracts prePlacedCount internally for cost
-      const jointSols = solveDFS(pzBoosted, 1, false, budget, seed, remainingBs, meta, 15000000, nsol);
-      if (jointSols.length > 0) {
-        return { sol: jointSols[0], method: "zero-aware(normal->zero)", alternates: [jointSols[0]], diagnosis };
-      }
-    }
-  }
-
-  self.postMessage({ type: "progress", info: "Phase 3: Zero-first search..." });
-  const zeroPz = { ...pzBoosted, cars: pz.cars.filter(c => isZeroCar(c)), order: [] };
-  const zeroSols = solveDFS(zeroPz, 50, false, budget, seed, bs, meta);
-  diagnosis.zeroCycleResult = { count: zeroSols.length };
-
-  if (zeroSols.length > 0) {
-    self.postMessage({ type: "progress", info: `Phase 4: Validating ${zeroSols.length} zero candidates with normal cars...` });
-    for (const zsol of zeroSols) {
-      const remainingBlanks = pz.blanks.filter(b => !zsol[pk(b[0], b[1])]);
-      const remainingBs = new Set(remainingBlanks.map(b => pk(b[0], b[1])));
-      const jointSols = solveDFS(pzBoosted, 1, false, budget, seed, remainingBs, meta, 15000000, zsol);
-      if (jointSols.length > 0) {
-        return { sol: jointSols[0], method: "zero-aware(zero->normal)", alternates: [jointSols[0]], diagnosis };
-      }
-    }
-  }
-
-  // Build compatibility diagnosis
-  if (diagnosis.normalOnlyResult.ok && diagnosis.zeroCycleResult.count > 0) {
-    diagnosis.compatResult = "auto-switch interaction conflict";
-  } else {
-    diagnosis.compatResult = !diagnosis.normalOnlyResult.ok ? "normal cars unsolvable" : "zero car cannot form cycle";
-  }
-
-  self.postMessage({ type: "progress", info: "Phase 5: Full Joint DFS fallback..." });
-  const jointSols = solveDFS(pzBoosted, 1, false, budget, seed, bs, meta, 100000000);
-  if (jointSols.length > 0) {
-    return { sol: jointSols[0], method: "zero-aware(joint)", alternates: jointSols, diagnosis };
-  }
-
-  return { sol: null, method: "zero-aware-exhausted", alternates: [], diagnosis };
-}
+/* solveZeroAware removed: the phased approach (solve normal/zero cars separately
+   then combine) has fundamental flaws — it cannot detect temporal collisions between
+   normal and zero cars during individual phases, and fails when car paths share
+   auto-switch state. Train 0 is now handled natively by CSP (excluded from path
+   enumeration, validated by simulate) and DFS (joint simulation with collision
+   detection). */
 
 // ═══════════ Worker entry point ═══════════
 
@@ -980,11 +969,10 @@ self.onmessage = function (e) {
   const features = puzzleHasDynamicState(pz);
 
   self.postMessage({ type: "progress", iters: 0, pruned });
-  
-  /* Zero-Aware Hybrid Solver disabled: the phased approach (solve normal/zero
-     cars separately then combine) fails for puzzles where car paths share
-     auto-switch state. The regular CSP+DFS path handles zero cars correctly
-     via simulate() and zeroSafetyLookahead() with native safety steps. */
+
+  /* Train 0 handling: CSP enumerates paths only for normal cars (zero car
+     excluded — it has no goal). DFS simulates all cars jointly with full
+     collision detection. Final validation uses simulate() + zeroSafetyLookahead(). */
 
   if (useful.length <= 45 && pz.cars.length <= 8) {
     /* Global triggers can flip remote state, which static CSP cannot model.
@@ -1016,8 +1004,10 @@ self.onmessage = function (e) {
     }
 
     /* Dynamic local state (auto-switches) can make static CSP incomplete.
-       Run CSP for candidates, but fall back to DFS unless the puzzle is static. */
-    const cspTrustworthy = lastCsp && !lastCsp.overflow && !features.isDynamic;
+       Run CSP for candidates, but fall back to DFS unless the puzzle is static.
+       FIX: Zero car paths are excluded from CSP, making it structurally incomplete
+       for zero-car puzzles — always fall through to DFS for joint simulation. */
+    const cspTrustworthy = lastCsp && !lastCsp.overflow && !features.isDynamic && !features.hasZero;
     if (bestSol && cspTrustworthy) {
       self.postMessage({ type: "done", method: "csp(slack=" + bestSlack + ")", info: lastCsp.info, pruned, alternates: bestAlternates }); return;
     }
