@@ -464,6 +464,8 @@ function solveCSP(pz, maxCost, bs, meta) {
       const nxt = [], triggeredColors = [], tsTriggeredColors = [], autoUsedKeys = [], releaseTSLocks = new Set();
       /* Edge-swap allowed in Railbound */
       for (const c of cars) {
+        /* Parked zero car: stays put forever */
+        if (c.parked) { nxt.push({ ...c }); continue; }
         if (c.wait > 0) { nxt.push({ ...c, wait: c.wait - 1 }); continue; }
         let x = c.x, y = c.y, entry = c.entry, nx, ny, ne;
         let usedTSLock = false, usedAutoSwitch = false;
@@ -479,20 +481,33 @@ function solveCSP(pz, maxCost, bs, meta) {
           const t = locked && locked.k === k ? locked.track : effectiveTrackAt(k, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
           usedTSLock = !!(locked && locked.k === k);
           usedAutoSwitch = !!autoSwitchMap[k] && !usedTSLock;
-          if (!t) return true;
-          const ex = exitPort(t, entry); if (!ex) return true;
+          /* No track or incompatible entry: always a collision (zero cars need track too) */
+          if (!t || !exitPort(t, entry)) {
+            return true;
+          }
+          const ex = exitPort(t, entry);
           nx = x + DELTA[ex][0]; ny = y + DELTA[ex][1]; ne = OPPOSITE[ex];
         }
         if (nx === gx && ny === gy) {
-          if (isZeroCar(c)) return true;
+          /* Zero car dead-end: exit leads to goal → park at current cell */
+          if (isZeroCar(c)) { nxt.push({ ...c, parked: true }); continue; }
           if (triggers[pk(nx, ny)]) triggeredColors.push(triggers[pk(nx, ny)]);
           if (tswTriggers[pk(nx, ny)]) tsTriggeredColors.push(tswTriggers[pk(nx, ny)]);
           if (usedTSLock) releaseTSLocks.add(c.name);
           if (usedAutoSwitch) autoUsedKeys.push(k);
           continue;
         }
-        if (nx < 0 || nx >= pz.width || ny < 0 || ny >= pz.height) return true;
+        /* Zero car dead-end: exit leads OOB → park at current cell */
+        if (nx < 0 || nx >= pz.width || ny < 0 || ny >= pz.height) {
+          if (isZeroCar(c)) { nxt.push({ ...c, parked: true }); continue; }
+          return true;
+        }
         const nk = pk(nx, ny);
+        /* Zero car dead-end: next cell has no traversable track or tunnel → park at current cell */
+        if (isZeroCar(c) && !tm[nk]) {
+          const nkTrack = effectiveTrackAt(nk, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
+          if (!nkTrack || !exitPort(nkTrack, ne)) { nxt.push({ ...c, parked: true }); continue; }
+        }
         if (barriers[nk]) {
           const b = barriers[nk], isT = toggled[b.color] || false;
           const cs = b.initialState === 'closed' ? (isT ? 'open' : 'closed') : (isT ? 'closed' : 'open');
@@ -764,6 +779,7 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
     if (!minTracks && solutions.length >= Math.max(maxSol, MAX_ALTERNATES)) return;
     for (const c0 of cars) {
       const c = c0; const k = pk(c.x, c.y);
+      if (c.parked) continue; /* parked zero car: no track needed */
       if (c.wait > 0) continue;
       if (tm[k]) continue;
       if (_tswitchMap[k]) continue;
@@ -783,8 +799,17 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
             }
             continue;
           }
-          /* Zero car can't traverse this placed track — simulation will catch this as an error */
-          return;
+          /* Zero car can't traverse this placed track — try upgrading to T-junction */
+          const ups = findUpgrades(old, c.x, c.y, c.entry);
+          for (const up of ups) {
+            if (up.exit === ex0) continue;
+            placed[k] = up.track;
+            const undo = pushUsage(k, c.entry, up.exit);
+            dfs(cars, arrived, step, visited, toggled, tsToggled, autoToggled, tsLocks, servedPlatforms); undo();
+            placed[k] = old;
+            if (!minTracks && solutions.length >= Math.max(maxSol, MAX_ALTERNATES)) return;
+          }
+          return; /* Zero car must have a traversable track — can't skip */
         }
         const ups = findUpgrades(old, c.x, c.y, c.entry);
         for (const up of ups) {
@@ -804,7 +829,10 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
         }
         return;
       }
-      if (!bs.has(k)) return;
+      if (!bs.has(k)) {
+        /* No track and not a blank cell — can't proceed (for any car) */
+        return;
+      }
       const cands = candidates(c);
       for (const tr of cands) {
         if (Object.keys(placed).length + 1 > bestCost) continue;
@@ -815,10 +843,11 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
         delete placed[k];
         if (!minTracks && solutions.length >= Math.max(maxSol, MAX_ALTERNATES)) return;
       }
+      /* All cars (including zero) must have a track placed — no skip option */
       return;
     }
     /* Build visited key with FULL dynamic state */
-    const sk = arrived.join(",") + "|" + cars.map(c => c.name + ":" + c.x + "," + c.y + "," + c.entry + ":" + (c.wait || 0)).sort().join("|") +
+    const sk = arrived.join(",") + "|" + cars.map(c => c.name + ":" + c.x + "," + c.y + "," + c.entry + ":" + (c.wait || 0) + (c.parked ? ":P" : "")).sort().join("|") +
       (_hasBars ? "|T:" + Object.keys(toggled).filter(k => toggled[k]).sort().join(",") : "") +
       (_hasTS ? "|TS:" + Object.keys(tsToggled).filter(k => tsToggled[k]).sort().join(",") + "|L:" + Object.keys(tsLocks).sort().map(n => n + ":" + tsLocks[n].k + ":" + tsLocks[n].track).join(",") : "") +
       (_hasAuto ? "|A:" + Object.keys(autoToggled).filter(k => autoToggled[k]).sort().join(",") : "") +
@@ -839,6 +868,8 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
     /* Edge-swap allowed in Railbound */
     for (const c0 of cars) {
       const c = c0; const k = pk(c.x, c.y);
+      /* Parked zero car: stays put forever */
+      if (c.parked) { nxt.push({ ...c }); continue; }
       if (c.wait > 0) { nxt.push({ ...c, wait: c.wait - 1 }); continue; }
       let nx, ny, ne, _usedTSLock = false, _usedAutoSwitch = false;
       if (tm[k]) {
@@ -852,13 +883,16 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
         const t = _locked && _locked.k === k ? _locked.track : effectiveTrackAt(k, { ...pz.fixed, ...placed }, _tswitchMap, tsToggled, _autoSwitchMap, autoToggled);
         _usedTSLock = !!(_locked && _locked.k === k);
         _usedAutoSwitch = !!_autoSwitchMap[k] && !_usedTSLock;
-        if (!t) { visited.delete(sk); return; }
-        const ex = exitPort(t, c.entry); if (!ex) { visited.delete(sk); return; }
+        /* No track or incompatible entry: always an error (zero cars need track too) */
+        if (!t || !exitPort(t, c.entry)) {
+          visited.delete(sk); return;
+        }
+        const ex = exitPort(t, c.entry);
         nx = c.x + DELTA[ex][0]; ny = c.y + DELTA[ex][1]; ne = OPPOSITE[ex];
       }
       if (nx === gx && ny === gy) {
-
-        if (isZeroCar(c)) { visited.delete(sk); return; }
+        /* Zero car dead-end: exit leads to goal → park at current cell */
+        if (isZeroCar(c)) { nxt.push({ ...c, parked: true }); continue; }
         if (!isZeroCar(c)) {
           if (ne !== ge) { visited.delete(sk); return; }
           if (carNeedsPassengers(_platformState, _nServed, c.name)) { visited.delete(sk); return; }
@@ -872,18 +906,24 @@ function solveDFS(pz, maxSol, minTracks, budget, seed, bs, meta, maxIters = 1500
         if (_usedTSLock) _releaseTSLocks.add(c.name);
         continue;
       }
-      if (nx < 0 || nx >= pz.width || ny < 0 || ny >= pz.height) { visited.delete(sk); return; }
+      /* Zero car dead-end: exit leads OOB → park at current cell */
+      if (nx < 0 || nx >= pz.width || ny < 0 || ny >= pz.height) {
+        if (isZeroCar(c)) { nxt.push({ ...c, parked: true }); continue; }
+        visited.delete(sk); return;
+      }
       const _nk = pk(nx, ny);
+      /* Zero car dead-end: next cell has no traversable track or tunnel → park at current cell */
+      if (isZeroCar(c) && !tm[_nk]) {
+        const _nkTrack = effectiveTrackAt(_nk, { ...pz.fixed, ...placed }, _tswitchMap, tsToggled, _autoSwitchMap, autoToggled);
+        if (!_nkTrack || !exitPort(_nkTrack, ne)) { nxt.push({ ...c, parked: true }); continue; }
+      }
       if (_barMap[_nk]) {
         const _b = _barMap[_nk], _isT = toggled[_b.color] || false;
         const _cs = _b.initialState === 'closed' ? (_isT ? 'open' : 'closed') : (_isT ? 'closed' : 'open');
         if (_cs === 'closed') { nx = c.x; ny = c.y; ne = c.entry; }
       }
       if (nx !== c.x || ny !== c.y) {
-        /* FIX: Apply cellCanAcceptDFS to ALL cars including zero cars.
-           Previously zero cars were exempted, letting them move to cells without
-           tracks. This caused the next DFS step to abort the entire branch
-           (no track for zero car), cascading into missed valid solutions. */
+        /* Apply cellCanAcceptDFS to ALL cars including zero cars. */
         if (!cellCanAcceptDFS(nx, ny, ne)) { visited.delete(sk); return; }
         if (_trigMap[_nk]) _trgd.push(_trigMap[_nk]);
         if (_tswMap[_nk]) _tsTrgd.push(_tswMap[_nk]);

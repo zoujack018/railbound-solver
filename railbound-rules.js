@@ -165,7 +165,7 @@ function zeroSafetySteps(puzzle) {
 }
 
 function zeroSafetyKey(cars, toggled, tsToggled, autoToggled, tsLocks) {
-  const carsKey = cars.map(c => `${c.name}:${c.x},${c.y},${c.entry}:${c.wait || 0}`).sort().join("|");
+  const carsKey = cars.map(c => `${c.name}:${c.x},${c.y},${c.entry}:${c.wait || 0}${c.parked ? ':P' : ''}`).sort().join("|");
   const onKeys = obj => Object.keys(obj || {}).filter(k => obj[k]).sort().join(",");
   const lockKey = Object.keys(tsLocks || {}).sort().map(n => `${n}:${tsLocks[n].k}:${tsLocks[n].track}`).join(",");
   return `${carsKey}|B:${onKeys(toggled)}|TS:${onKeys(tsToggled)}|A:${onKeys(autoToggled)}|L:${lockKey}`;
@@ -200,6 +200,8 @@ function zeroSafetyLookahead(puzzle, cars, ctx) {
 
     for (const c of zeroCars) {
       const k = pk(c.x, c.y);
+      /* Parked zero car: stays put forever — trivially safe */
+      if (c.parked) { nxt.push({ ...c }); continue; }
       if (c.wait > 0) {
         nxt.push({ ...c, wait: c.wait - 1 });
         continue;
@@ -218,16 +220,25 @@ function zeroSafetyLookahead(puzzle, cars, ctx) {
         const tr = locked && locked.k === k ? locked.track : effectiveTrackAt(k, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
         usedTSLock = !!(locked && locked.k === k);
         usedAutoSwitch = !!autoSwitchMap[k] && !usedTSLock;
-        if (!tr) return { ok: false, reason: `${c.name} 无轨道 @(${c.x},${c.y})`, detail: { errorCode: 'NO_TRACK', car: c.name, cell: k, x: c.x, y: c.y } };
+        /* No track or incompatible entry: zero car safety failure */
+        if (!tr || !exitPort(tr, c.entry)) {
+          return { ok: false, reason: `${c.name} 无法通行`, detail: { errorCode: !tr ? 'NO_TRACK' : 'PORT_MISMATCH', car: c.name, cell: k } };
+        }
         const ex = exitPort(tr, c.entry);
-        if (!ex) return { ok: false, reason: `${c.name} 端口不匹配`, detail: { errorCode: 'PORT_MISMATCH', car: c.name, cell: k, track: tr, entry: c.entry, x: c.x, y: c.y } };
         nx = c.x + DELTA[ex][0]; ny = c.y + DELTA[ex][1]; ne = OPPOSITE[ex];
       }
 
-      if (nx === puzzle.goal[0] && ny === puzzle.goal[1]) return { ok: false, reason: `${c.name} 进终点`, detail: { errorCode: 'ZERO_AT_GOAL', car: c.name, from: k, goal: pk(nx, ny) } };
-      if (nx < 0 || nx >= puzzle.width || ny < 0 || ny >= puzzle.height) return { ok: false, reason: `${c.name} 出界`, detail: { errorCode: 'OUT_OF_BOUNDS', car: c.name, from: k, target: pk(nx, ny) } };
+      /* Zero car dead-end parking: exit leads to goal, OOB, or trackless cell → stay put */
+      if (nx === puzzle.goal[0] && ny === puzzle.goal[1]) { nxt.push({ ...c, parked: true }); continue; }
+      if (nx < 0 || nx >= puzzle.width || ny < 0 || ny >= puzzle.height) { nxt.push({ ...c, parked: true }); continue; }
 
       const nk = pk(nx, ny);
+      /* Check if next cell has a traversable track or tunnel before moving */
+      if (!tm[nk]) {
+        const nkTrack = effectiveTrackAt(nk, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
+        if (!nkTrack || !exitPort(nkTrack, ne)) { nxt.push({ ...c, parked: true }); continue; }
+      }
+
       if (barriers[nk]) {
         const b = barriers[nk];
         const isToggled = toggled[b.color] || false;
@@ -355,6 +366,8 @@ function simulate(puzzle, placed) {
     for (const c0 of cars) {
       const c = c0;
       const k = pk(c.x, c.y);
+      /* Parked zero car: stays put forever */
+      if (c.parked) { nxt.push({ ...c }); continue; }
       if (c.wait > 0) {
         nxt.push({ ...c, wait: c.wait - 1 });
         continue;
@@ -372,13 +385,18 @@ function simulate(puzzle, placed) {
         const tr = locked && locked.k === k ? locked.track : effectiveTrackAt(k, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
         usedTSLock = !!(locked && locked.k === k);
         usedAutoSwitch = !!autoSwitchMap[k] && !usedTSLock;
-        if (!tr) return { ok: false, reason: `${c.name} 无轨道 @(${c.x},${c.y})`, arrived, steps: t, history, detail: { errorCode: 'NO_TRACK', car: c.name, cell: k, x: c.x, y: c.y, isAutoSwitch: !!autoSwitchMap[k] } };
-        const ex = exitPort(tr, c.entry); if (!ex) return { ok: false, reason: `${c.name} 端口不匹配`, arrived, steps: t, history, detail: { errorCode: 'PORT_MISMATCH', car: c.name, cell: k, track: tr, entry: c.entry, x: c.x, y: c.y, isAutoSwitch: usedAutoSwitch, isLocked: usedTSLock } };
+        /* No track or incompatible entry: always an error (zero cars need track too) */
+        if (!tr || !exitPort(tr, c.entry)) {
+          if (!tr) return { ok: false, reason: `${c.name} 无轨道 @(${c.x},${c.y})`, arrived, steps: t, history, detail: { errorCode: 'NO_TRACK', car: c.name, cell: k, x: c.x, y: c.y, isAutoSwitch: !!autoSwitchMap[k] } };
+          return { ok: false, reason: `${c.name} 端口不匹配`, arrived, steps: t, history, detail: { errorCode: 'PORT_MISMATCH', car: c.name, cell: k, track: tr, entry: c.entry, x: c.x, y: c.y, isAutoSwitch: usedAutoSwitch, isLocked: usedTSLock } };
+        }
+        const ex = exitPort(tr, c.entry);
         nx = c.x + DELTA[ex][0]; ny = c.y + DELTA[ex][1]; ne = OPPOSITE[ex];
       }
 
       if (nx === puzzle.goal[0] && ny === puzzle.goal[1]) {
-        if (isZeroCar(c)) return { ok: false, reason: `${c.name} 进终点`, arrived, steps: t, history, detail: { errorCode: 'ZERO_AT_GOAL', car: c.name, from: k } };
+        /* Zero car dead-end: exit leads to goal → park at current cell */
+        if (isZeroCar(c)) { nxt.push({ ...c, parked: true }); continue; }
         if (!isZeroCar(c)) {
           if (ne !== ge) return { ok: false, reason: `${c.name} 进站方向错`, arrived, steps: t, history, detail: { errorCode: 'WRONG_GOAL_DIR', car: c.name, actual: ne, expected: ge } };
           if (carNeedsPassengers(platformState, servedPlatforms, c.name)) return { ok: false, reason: `${c.name} 未完成接客`, arrived, steps: t, history, detail: { errorCode: 'UNSERVED_PLATFORM', car: c.name } };
@@ -391,9 +409,19 @@ function simulate(puzzle, placed) {
         if (usedAutoSwitch) autoUsedKeys.push(k);
         continue;
       }
-      if (nx < 0 || nx >= puzzle.width || ny < 0 || ny >= puzzle.height) return { ok: false, reason: `${c.name} 出界`, arrived, steps: t, history, detail: { errorCode: 'OUT_OF_BOUNDS', car: c.name, from: k, target: pk(nx, ny) } };
+      /* Zero car dead-end: exit leads OOB → park at current cell */
+      if (nx < 0 || nx >= puzzle.width || ny < 0 || ny >= puzzle.height) {
+        if (isZeroCar(c)) { nxt.push({ ...c, parked: true }); continue; }
+        return { ok: false, reason: `${c.name} 出界`, arrived, steps: t, history, detail: { errorCode: 'OUT_OF_BOUNDS', car: c.name, from: k, target: pk(nx, ny) } };
+      }
 
       const nk = pk(nx, ny);
+      /* Zero car dead-end: next cell has no traversable track or tunnel → park at current cell */
+      if (isZeroCar(c) && !tm[nk]) {
+        const nkTrack = effectiveTrackAt(nk, tracks, tswitchMap, tsToggled, autoSwitchMap, autoToggled);
+        if (!nkTrack || !exitPort(nkTrack, ne)) { nxt.push({ ...c, parked: true }); continue; }
+      }
+
       if (barriers[nk]) {
         const b = barriers[nk];
         const isToggled = toggled[b.color] || false;

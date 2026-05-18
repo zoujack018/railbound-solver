@@ -33,8 +33,8 @@ function carLabel(c) { return isZeroCarCell(c) ? "0" : String(c?.name ?? ""); }
 function classifyTracks() {
   return {
     straights: ["|", "-"],
-    curves: ["ES", "SW", "NE", "WN"],
-    tees: ["T_ES_N", "T_ES_W", "T_SW_E", "T_SW_N", "T_NE_S", "T_NE_W", "T_WN_E", "T_WN_S"],
+    curves: ["WN", "NE", "SW", "ES"],
+    tees: ["T_WN_E", "T_WN_S", "T_NE_S", "T_NE_W", "T_SW_N", "T_SW_E", "T_ES_N", "T_ES_W"],
   };
 }
 
@@ -94,8 +94,9 @@ export default function App() {
       else if (tool === "fixed") g[k] = { t: "fixed", track: trkPick };
       else if (tool === "gate") {
         if (gateMode === "trigger") {
+          const allTriggerTracks = [...BASIC_TRACKS, ...T_TRACKS];
           if (p[k]?.t === "trigger" && p[k].color === barrierColor) {
-            const seq = BASIC_TRACKS;
+            const seq = allTriggerTracks;
             const next = p[k].track === tswTriggerTrack ? seq[(seq.indexOf(p[k].track) + 1) % seq.length] : tswTriggerTrack;
             g[k] = { ...p[k], track: next };
           } else g[k] = { t: "trigger", color: barrierColor, track: tswTriggerTrack };
@@ -454,11 +455,13 @@ export default function App() {
                 <div style={{ marginTop: 8 }}>
                   <TrackGroup label="关卡底轨 · 直线" tracks={trackGroups.straights} pick={barrierTrack} onPick={setBarrierTrack} columns={2} />
                   <TrackGroup label="关卡底轨 · 弯道" tracks={trackGroups.curves} pick={barrierTrack} onPick={setBarrierTrack} columns={2} />
+                  <TrackGroup label="关卡底轨 · 三头" tracks={trackGroups.tees} pick={barrierTrack} onPick={setBarrierTrack} columns={4} />
                 </div>
               </>}
               {gateMode === "trigger" && <div style={{ marginTop: 8 }}>
                 <TrackGroup label="触发器底轨 · 直线" tracks={trackGroups.straights} pick={tswTriggerTrack} onPick={setTswTriggerTrack} columns={2} />
                 <TrackGroup label="触发器底轨 · 弯道" tracks={trackGroups.curves} pick={tswTriggerTrack} onPick={setTswTriggerTrack} columns={2} />
+                <TrackGroup label="触发器底轨 · 三头" tracks={trackGroups.tees} pick={tswTriggerTrack} onPick={setTswTriggerTrack} columns={4} />
               </div>}
               {gateMode === "tswitch" && <div style={{ marginTop: 8 }}>
                 <div style={{ fontSize: 10, color: dm, marginBottom: 3 }}>初始T轨</div>
